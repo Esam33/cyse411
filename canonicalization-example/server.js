@@ -1,94 +1,101 @@
-// idor/server.js
-const express = require('express');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
+// canonicalization-example/server.js
+const express = require("express");
+const path = require("path");
+const fs = require("fs");
+const { body, validationResult } = require("express-validator");
 
 const app = express();
 
-app.use(helmet({ contentSecurityPolicy: false }));
+app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
 
-// Fake "database"
-const users = [
-  { id: 1, name: 'Alice', role: 'customer', department: 'north' },
-  { id: 2, name: 'Bob', role: 'customer', department: 'south' },
-  { id: 3, name: 'Charlie', role: 'support', department: 'north' }
-];
-
-const orders = [
-  { id: 1, userId: 1, item: 'Laptop',  region: 'north', total: 2000 },
-  { id: 2, userId: 1, item: 'Mouse',   region: 'north', total:  40 },
-  { id: 3, userId: 2, item: 'Monitor', region: 'south', total: 300 },
-  { id: 4, userId: 2, item: 'Keyboard', region: 'south', total:  60 }
-];
-
-// Rate-limit access to the orders API
-const ordersLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 50,
-  standardHeaders: true,
-  legacyHeaders: false
-});
-
-// Very simple "authentication" via headers
-// X-User-Id: <user id>
-function fakeAuth(req, res, next) {
-  const idHeader = req.header('X-User-Id');
-  const id = parseInt(idHeader, 10);
-
-  if (!Number.isInteger(id)) {
-    return res.status(401).json({ error: 'Unauthenticated: set valid X-User-Id header' });
-  }
-
-  const user = users.find((u) => u.id === id);
-  if (!user) {
-    return res.status(401).json({ error: 'Unauthenticated: unknown user' });
-  }
-
-  req.user = user;
-  next();
+const BASE_DIR = path.resolve(__dirname, "files");
+if (!fs.existsSync(BASE_DIR)) {
+  fs.mkdirSync(BASE_DIR, { recursive: true });
 }
 
-// Apply fakeAuth to all routes below
-app.use(fakeAuth);
+// Helper: canonicalize and normalize path
+function resolveSafe(baseDir, userInput) {
+  try {
+    userInput = decodeURIComponent(userInput);
+  } catch (e) {
+    // ignore decode errors and use raw value
+  }
+  return path.resolve(baseDir, userInput);
+}
 
-// --- Secure orders endpoint ---
-// Only the owner of the order OR a support user can see an order.
-app.get('/orders/:id', ordersLimiter, (req, res) => {
-  const orderId = parseInt(req.params.id, 10);
-  if (!Number.isInteger(orderId)) {
-    return res.status(400).json({ error: 'Invalid order id' });
+// Common validation for filenames
+const validateFilename = [
+  body("filename")
+    .exists()
+    .withMessage("filename required")
+    .bail()
+    .isString()
+    .trim()
+    .notEmpty()
+    .withMessage("filename must not be empty")
+    .custom((value) => {
+      if (value.includes("\0")) {
+        throw new Error("null byte not allowed");
+      }
+      return true;
+    }),
+];
+
+// Shared handler used by both endpoints
+function handleRead(req, res) {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
   }
 
-  const order = orders.find((o) => o.id === orderId);
-  if (!order) {
-    return res.status(404).json({ error: 'Order not found' });
+  const filename = req.body.filename;
+  const normalized = resolveSafe(BASE_DIR, filename);
+
+  // Ensure we stayed inside BASE_DIR
+  if (!normalized.startsWith(BASE_DIR + path.sep)) {
+    return res.status(403).json({ error: "Path traversal detected" });
   }
 
-  // Enforce ownership / authorization
-  const isOwner = order.userId === req.user.id;
-  const isSupport = req.user.role === 'support';
-
-  if (!isOwner && !isSupport) {
-    // Previously: IDOR vulnerability, we returned the order unconditionally.
-    return res.status(403).json({ error: 'Forbidden: you are not allowed to see this order' });
+  if (!fs.existsSync(normalized)) {
+    return res.status(404).json({ error: "File not found" });
   }
 
-  res.json(order);
-});
+  const content = fs.readFileSync(normalized, "utf8");
+  res.json({ path: normalized, content });
+}
 
-// Simple health check
-app.get('/', (req, res) => {
-  res.json({
-    message: 'Access Control Tutorial API',
-    currentUser: { id: req.user.id, name: req.user.name, role: req.user.role }
+// SECURE route (already safe)
+app.post("/read", validateFilename, handleRead);
+
+// PREVIOUSLY-VULNERABLE route now reuses the same safe logic
+app.post("/read-no-validate", validateFilename, handleRead);
+
+// Helper route for samples
+app.post("/setup-sample", (req, res) => {
+  const samples = {
+    "hello.txt": "Hello from safe file!\n",
+    "notes/readme.md": "# Readme\nSample readme file\n",
+  };
+
+  Object.keys(samples).forEach((k) => {
+    const p = path.resolve(BASE_DIR, k);
+    const d = path.dirname(p);
+    if (!fs.existsSync(d)) {
+      fs.mkdirSync(d, { recursive: true });
+    }
+    fs.writeFileSync(p, samples[k], "utf8");
   });
+
+  res.json({ ok: true, base: BASE_DIR });
 });
 
+// Only listen when run directly
 if (require.main === module) {
-  const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
-    console.log(`IDOR lab listening at http://localhost:${PORT}`);
+  const port = process.env.PORT || 4000;
+  app.listen(port, () => {
+    console.log(`Canonicalization server listening on http://localhost:${port}`);
   });
 }
 
