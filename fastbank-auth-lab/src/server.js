@@ -1,54 +1,72 @@
-// server.js (FIXED - secure auth, hashing, sessions, rate limiting)
-
+// fastbank-auth-lab/src/server.js
 const express = require('express');
 const bodyParser = require('body-parser');
 const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
 const bcrypt = require('bcrypt');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const csrf = require('csurf');
 
 const app = express();
 const PORT = 3001;
+const IS_PROD = process.env.NODE_ENV === 'production';
 
-// ---------- Middleware ----------
+// --- Security middleware ---
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 app.use(cookieParser());
+
+// Global (light) rate limiting
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false
+});
+app.use(globalLimiter);
+
+// Serve static login page / JS bundle
 app.use(express.static('public'));
 
-// In-memory user + session stores
-// Password now stored using bcrypt instead of fast SHA-256
+// --- User "database" (in-memory) ---
+const PASSWORD_PLAIN = 'password123';
+const PASSWORD_HASH = bcrypt.hashSync(PASSWORD_PLAIN, 12);
+
 const users = [
   {
     id: 1,
     username: 'student',
-    passwordHash: bcrypt.hashSync('password123', 10), // strong salted hash
-  },
+    passwordHash: PASSWORD_HASH
+  }
 ];
 
-const sessions = {}; // token -> { userId, createdAt }
+// --- Session store ---
+const sessions = new Map(); // token -> { userId, createdAt, expiresAt }
 
-// Simple login rate limiter (per username)
-const loginAttempts = {}; // username -> { count, firstTs }
-const MAX_ATTEMPTS = 5;
-const WINDOW_MS = 5 * 60 * 1000; // 5 minutes
-
-function isRateLimited(username) {
+// Create a cryptographically strong session token
+function createSession(userId) {
+  const token = crypto.randomBytes(32).toString('hex');
   const now = Date.now();
-  const entry = loginAttempts[username];
+  const expiresAt = now + 60 * 60 * 1000; // 1 hour
 
-  if (!entry) {
-    loginAttempts[username] = { count: 1, firstTs: now };
-    return false;
+  sessions.set(token, { userId, createdAt: now, expiresAt });
+  return token;
+}
+
+function getSession(token) {
+  const session = sessions.get(token);
+  if (!session) return null;
+  if (session.expiresAt < Date.now()) {
+    sessions.delete(token);
+    return null;
   }
+  return session;
+}
 
-  if (now - entry.firstTs > WINDOW_MS) {
-    // reset window
-    loginAttempts[username] = { count: 1, firstTs: now };
-    return false;
-  }
-
-  entry.count += 1;
-  return entry.count > MAX_ATTEMPTS;
+function destroySession(token) {
+  sessions.delete(token);
 }
 
 // Helper: find user by username
@@ -56,114 +74,119 @@ function findUser(username) {
   return users.find((u) => u.username === username);
 }
 
-// Helper: generate strong random token
-function generateSessionToken() {
-  return crypto.randomBytes(32).toString('hex');
-}
-
-// Helper: create session + cookie
-function createSession(res, userId) {
-  const token = generateSessionToken();
-  sessions[token] = {
-    userId,
-    createdAt: Date.now(),
-  };
-
-  // Secure cookie flags added
-  res.cookie('session', token, {
-    httpOnly: true,
-    secure: true,      // assume HTTPS in production; OK for demo
-    sameSite: 'lax',
-    maxAge: 30 * 60 * 1000, // 30 minutes
-  });
-
-  return token;
-}
-
-// Middleware to load session from cookie
-function loadSession(req, res, next) {
+// --- Authentication middleware ---
+function attachUser(req, res, next) {
   const token = req.cookies.session;
-  if (!token || !sessions[token]) {
-    req.session = null;
+  if (!token) {
     return next();
   }
 
-  const session = sessions[token];
-
-  // Simple expiration check (30 minutes)
-  const age = Date.now() - session.createdAt;
-  if (age > 30 * 60 * 1000) {
-    delete sessions[token];
-    req.session = null;
+  const session = getSession(token);
+  if (!session) {
     return next();
   }
 
-  req.session = session;
+  const user = users.find((u) => u.id === session.userId);
+  if (!user) {
+    return next();
+  }
+
+  req.user = { id: user.id, username: user.username };
   next();
 }
 
-app.use(loadSession);
+app.use(attachUser);
 
-// ---------- Routes ----------
-
-// Show who is logged in
-app.get('/api/me', (req, res) => {
-  if (!req.session) {
+// Require authentication for protected routes
+function requireAuth(req, res, next) {
+  if (!req.user) {
     return res.status(401).json({ authenticated: false });
   }
+  next();
+}
 
-  const user = users.find((u) => u.id === req.session.userId);
-  if (!user) {
-    return res.status(401).json({ authenticated: false });
+// --- CSRF protection ---
+const csrfProtection = csrf({
+  cookie: {
+    httpOnly: true,
+    secure: IS_PROD,
+    sameSite: 'lax'
   }
-
-  res.json({ authenticated: true, username: user.username });
 });
 
-// Secure login endpoint
-app.post('/api/login', async (req, res) => {
+// Endpoint to fetch CSRF token (frontend calls this first)
+app.get('/csrf-token', csrfProtection, (req, res) => {
+  res.json({ csrfToken: req.csrfToken() });
+});
+
+// --- Rate limit login attempts ---
+const loginLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  message: 'Too many login attempts, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+// --- API: Who am I? ---
+app.get('/api/me', requireAuth, (req, res) => {
+  res.json({ authenticated: true, username: req.user.username });
+});
+
+// --- API: Login (secure) ---
+// Uses bcrypt, CSRF, and rate limiting; no username enumeration.
+app.post('/api/login', loginLimiter, csrfProtection, async (req, res) => {
   const { username, password } = req.body || {};
 
-  if (!username || !password) {
-    return res.status(400).json({ success: false, message: 'Missing credentials' });
-  }
-
-  // Rate limiting per username
-  if (isRateLimited(username)) {
-    return res
-      .status(429)
-      .json({ success: false, message: 'Too many login attempts, please try again later.' });
+  if (typeof username !== 'string' || typeof password !== 'string') {
+    return res.status(400).json({ success: false, message: 'Invalid request' });
   }
 
   const user = findUser(username);
-  if (!user) {
-    // Generic message to avoid username enumeration
-    return res.status(401).json({ success: false, message: 'Invalid username or password' });
+
+  // To avoid timing differences & username enumeration, always run bcrypt
+  const hashToCompare = user ? user.passwordHash : PASSWORD_HASH;
+  const passwordMatches = await bcrypt.compare(password, hashToCompare);
+
+  if (!user || !passwordMatches) {
+    return res
+      .status(401)
+      .json({ success: false, message: 'Invalid username or password' });
   }
 
-  const ok = await bcrypt.compare(password, user.passwordHash);
-  if (!ok) {
-    return res.status(401).json({ success: false, message: 'Invalid username or password' });
-  }
+  const token = createSession(user.id);
 
-  const token = createSession(res, user.id);
+  res.cookie('session', token, {
+    httpOnly: true,
+    secure: IS_PROD,
+    sameSite: 'lax',
+    maxAge: 60 * 60 * 1000 // 1 hour
+  });
 
-  // Do NOT leak token via JSON in a real app; here we just confirm success
-  res.json({ success: true, tokenIssued: !!token });
-});
-
-// Logout endpoint
-app.post('/api/logout', (req, res) => {
-  const token = req.cookies.session;
-  if (token && sessions[token]) {
-    delete sessions[token];
-  }
-
-  res.clearCookie('session');
   res.json({ success: true });
 });
 
-// ---------- Start server ----------
+// --- API: Logout (secure) ---
+app.post('/api/logout', csrfProtection, requireAuth, (req, res) => {
+  const token = req.cookies.session;
+  if (token) {
+    destroySession(token);
+  }
+
+  res.clearCookie('session', {
+    httpOnly: true,
+    secure: IS_PROD,
+    sameSite: 'lax'
+  });
+
+  res.json({ success: true });
+});
+
+// Health check
+app.get('/', (req, res) => {
+  res.json({ message: 'FastBank Auth Lab (secure)' });
+});
+
 app.listen(PORT, () => {
   console.log(`FastBank Auth Lab running at http://localhost:${PORT}`);
 });
