@@ -1,3 +1,8 @@
+permissions:
+  contents: read
+  security-events: write
+
+
 name: DAST - OWASP ZAP Full Scan
 
 on:
